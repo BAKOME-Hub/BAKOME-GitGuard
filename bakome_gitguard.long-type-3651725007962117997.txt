@@ -1,0 +1,1 @@
+&std::iter::Take<std::slice::Iter<'_, MalwareFinding>>
